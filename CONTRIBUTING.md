@@ -53,7 +53,7 @@ To set up your development environment:
 
 1. Clone the repository
    ```bash
-   git clone https://github.com/yourusername/nrtf.git
+   git clone https://github.com/Gh05t666nero/nrtf.git
    cd nrtf
    ```
 
