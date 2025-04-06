@@ -442,7 +442,10 @@ async def stop_test(
     """
     Stop a running test
     """
+    logger.info(f"Received request to stop test {test_id} from user {user}")
+
     if test_id not in tests:
+        logger.warning(f"Test {test_id} not found")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Test not found"
@@ -452,49 +455,73 @@ async def stop_test(
 
     # Check if user has access to this test
     if test["user"] != user:
+        logger.warning(f"User {user} does not have access to test {test_id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You don't have access to this test"
         )
 
-    # Only allow stopping running tests
+    # Allow stopping tests in any state, but only mark as stopped if running
     if test["status"] != TestStatus.RUNNING:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot stop test with status {test['status']}"
+        logger.info(f"Test {test_id} is not running (current status: {test['status']}). Returning current state.")
+        return TestResponse(
+            id=test_id,
+            target=test["target"],
+            method=test["method"],
+            status=test["status"],
+            start_time=test.get("start_time"),
+            end_time=test.get("end_time"),
+            user=test["user"]
         )
 
     # Attempt to stop the test
     try:
         service_url = get_service_url(test["method"])
+        logger.info(f"Stopping test {test_id} on service {service_url}")
 
-        # Find the module_test_id from the results
-        # In a real implementation, you would store this when the test is initiated
-        module_test_id = None
-        for module_result_id, result in test_results.items():
-            if isinstance(result, dict) and result.get("test_id") == test_id:
-                module_test_id = module_result_id
-                break
+        # Find the module_test_id (either from the test info or results)
+        module_test_id = test.get("module_test_id")
 
         if not module_test_id:
-            # If we can't find it, we'll create a new random ID
-            # This is a workaround - in a real implementation, store the module_test_id when test starts
+            for result_id, result in test_results.items():
+                if isinstance(result, dict) and result.get("test_id") == test_id:
+                    module_test_id = result_id
+                    break
+
+        if not module_test_id:
+            # If we can't find it, use the test_id as fallback
             module_test_id = test_id
+            logger.warning(f"Could not find module_test_id for test {test_id}, using test_id as fallback")
 
-        async with httpx.AsyncClient() as client:
-            response = await client.delete(
-                f"{service_url}/execute/{module_test_id}"
-            )
+        # Use a longer timeout for the stop request
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            try:
+                logger.info(f"Sending DELETE request to {service_url}/execute/{module_test_id}")
+                response = await client.delete(
+                    f"{service_url}/execute/{module_test_id}"
+                )
 
-            test["status"] = TestStatus.STOPPED
-            test["end_time"] = time.time()
+                if response.status_code >= 400:
+                    logger.warning(
+                        f"Received error response when stopping test: {response.status_code} - {response.text}")
+                    # Continue with marking test as stopped even if module reports an error
+
+                logger.info(f"Successfully sent stop request for test {test_id}")
+            except Exception as e:
+                logger.error(f"Error communicating with module service: {str(e)}")
+                # Continue with marking test as stopped even if communication fails
+
+        # Mark the test as stopped regardless of the module response
+        test["status"] = TestStatus.STOPPED
+        test["end_time"] = time.time()
+        logger.info(f"Marked test {test_id} as stopped")
 
     except Exception as e:
-        logger.error(f"Error stopping test {test_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error stopping test: {str(e)}"
-        )
+        logger.error(f"Error stopping test {test_id}: {str(e)}")
+        # Still mark test as stopped even if there was an error
+        test["status"] = TestStatus.STOPPED
+        test["end_time"] = time.time()
+        logger.info(f"Marked test {test_id} as stopped despite error")
 
     return TestResponse(
         id=test_id,

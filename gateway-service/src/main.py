@@ -46,6 +46,9 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 # Service URLs (would be environment variables in production)
 ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://orchestrator:8000")
 
+# HTTP client settings
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30.0"))  # 30 seconds default timeout
+
 
 # Models
 class Token(BaseModel):
@@ -147,6 +150,33 @@ async def get_current_active_user(current_user: User = Depends(get_current_user)
     return current_user
 
 
+# Helper function for making HTTP requests with retry
+async def make_request(method, url, **kwargs):
+    """Make an HTTP request with retry logic"""
+    max_retries = 3
+    timeout = kwargs.pop('timeout', HTTP_TIMEOUT)
+
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                if method.lower() == 'get':
+                    response = await client.get(url, **kwargs)
+                elif method.lower() == 'post':
+                    response = await client.post(url, **kwargs)
+                elif method.lower() == 'delete':
+                    response = await client.delete(url, **kwargs)
+                else:
+                    raise ValueError(f"Unsupported HTTP method: {method}")
+
+                return response
+        except httpx.RequestError as e:
+            logger.error(f"Request error (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt == max_retries - 1:  # Last attempt
+                raise
+            # Wait a bit before retrying
+            await asyncio.sleep(1 * (attempt + 1))  # Exponential backoff
+
+
 # Routes
 @app.post("/token", response_model=Token)
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
@@ -188,13 +218,13 @@ async def create_test(
 
     # Forward request to orchestrator
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{ORCHESTRATOR_URL}/test",
-                json=test_request.dict(),
-                headers={"X-User": current_user.username}
-            )
-            return response.json()
+        response = await make_request(
+            'post',
+            f"{ORCHESTRATOR_URL}/test",
+            json=test_request.dict(),
+            headers={"X-User": current_user.username}
+        )
+        return response.json()
     except httpx.RequestError as e:
         logger.error(f"Error communicating with orchestrator: {e}")
         raise HTTPException(
@@ -209,12 +239,12 @@ async def get_tests(current_user: User = Depends(get_current_active_user)):
     Get all tests for the current user
     """
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{ORCHESTRATOR_URL}/tests",
-                headers={"X-User": current_user.username}
-            )
-            return response.json()
+        response = await make_request(
+            'get',
+            f"{ORCHESTRATOR_URL}/tests",
+            headers={"X-User": current_user.username}
+        )
+        return response.json()
     except httpx.RequestError as e:
         logger.error(f"Error communicating with orchestrator: {e}")
         raise HTTPException(
@@ -232,17 +262,17 @@ async def get_test(
     Get details for a specific test
     """
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{ORCHESTRATOR_URL}/test/{test_id}",
-                headers={"X-User": current_user.username}
+        response = await make_request(
+            'get',
+            f"{ORCHESTRATOR_URL}/test/{test_id}",
+            headers={"X-User": current_user.username}
+        )
+        if response.status_code == 404:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Test not found"
             )
-            if response.status_code == 404:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Test not found"
-                )
-            return response.json()
+        return response.json()
     except httpx.RequestError as e:
         logger.error(f"Error communicating with orchestrator: {e}")
         raise HTTPException(
@@ -260,17 +290,52 @@ async def stop_test(
     Stop a running test
     """
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.delete(
-                f"{ORCHESTRATOR_URL}/test/{test_id}",
-                headers={"X-User": current_user.username}
+        logger.info(f"User {current_user.username} attempting to stop test {test_id}")
+
+        # Increase timeout for stop operations
+        response = await make_request(
+            'delete',
+            f"{ORCHESTRATOR_URL}/test/{test_id}",
+            headers={"X-User": current_user.username},
+            timeout=60.0  # Longer timeout for stopping tests
+        )
+
+        if response.status_code == 404:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Test not found"
             )
-            if response.status_code == 404:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Test not found"
-                )
-            return response.json()
+
+        logger.info(f"Successfully stopped test {test_id}")
+        return response.json()
+    except httpx.RequestError as e:
+        logger.error(f"Error communicating with orchestrator when stopping test {test_id}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Service temporarily unavailable. Error: {str(e)}"
+        )
+
+
+@app.get("/api/test/{test_id}/results")
+async def get_test_results(
+        test_id: str,
+        current_user: User = Depends(get_current_active_user)
+):
+    """
+    Get results for a specific test
+    """
+    try:
+        response = await make_request(
+            'get',
+            f"{ORCHESTRATOR_URL}/test/{test_id}/results",
+            headers={"X-User": current_user.username}
+        )
+        if response.status_code == 404:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Test results not found"
+            )
+        return response.json()
     except httpx.RequestError as e:
         logger.error(f"Error communicating with orchestrator: {e}")
         raise HTTPException(
@@ -285,9 +350,11 @@ async def get_methods(current_user: User = Depends(get_current_active_user)):
     Get all available test methods
     """
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(f"{ORCHESTRATOR_URL}/methods")
-            return response.json()
+        response = await make_request(
+            'get',
+            f"{ORCHESTRATOR_URL}/methods"
+        )
+        return response.json()
     except httpx.RequestError as e:
         logger.error(f"Error communicating with orchestrator: {e}")
         raise HTTPException(
@@ -301,8 +368,27 @@ async def health_check():
     """
     Health check endpoint
     """
-    return {"status": "healthy"}
+    try:
+        response = await make_request(
+            'get',
+            f"{ORCHESTRATOR_URL}/health",
+            timeout=5.0
+        )
+        orchestrator_status = response.json().get("status", "unknown")
+        return {
+            "status": "healthy",
+            "orchestrator": orchestrator_status
+        }
+    except Exception as e:
+        logger.warning(f"Health check failed: {e}")
+        return {
+            "status": "degraded",
+            "orchestrator": "unreachable",
+            "error": str(e)
+        }
 
+
+import asyncio
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=True)
