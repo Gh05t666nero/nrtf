@@ -11,6 +11,10 @@ import struct
 import socket
 import threading
 import ipaddress
+import signal
+import sys
+import atexit
+import weakref
 from datetime import datetime
 from enum import Enum
 import concurrent.futures
@@ -35,6 +39,12 @@ app = FastAPI(
 active_tests = {}
 test_results = {}
 test_stop_events = {}
+
+# Global variables for resource tracking
+active_executors = weakref.WeakSet()
+active_sockets = weakref.WeakSet()
+shutdown_in_progress = False
+cleanup_lock = threading.Lock()
 
 
 # Models
@@ -121,9 +131,89 @@ class TestMetrics:
             "successful_connects": self.successful_connects.value(),
             "failed_connects": self.failed_connects.value(),
             "duration": (self.end_time or time.time()) - self.start_time,
-            "packets_per_second": self.packets_sent.value() / ((self.end_time or time.time()) - self.start_time),
+            "packets_per_second": self.packets_sent.value() / max(0.1,
+                                                                  (self.end_time or time.time()) - self.start_time),
             "success_rate": (self.successful_connects.value() / max(1, self.packets_sent.value())) * 100
         }
+
+
+# Resource management functions
+def register_socket(sock):
+    """Register a socket for tracking and cleanup"""
+    if not shutdown_in_progress:
+        active_sockets.add(sock)
+    return sock
+
+
+def register_executor(executor):
+    """Register a thread pool executor for tracking and cleanup"""
+    if not shutdown_in_progress:
+        active_executors.add(executor)
+    return executor
+
+
+def cleanup_resources():
+    """Clean up all tracked resources"""
+    global shutdown_in_progress
+
+    with cleanup_lock:
+        if shutdown_in_progress:
+            return
+        shutdown_in_progress = True
+
+        logger.info("Starting resource cleanup...")
+
+        # Stop all tests
+        for test_id, stop_event in list(test_stop_events.items()):
+            logger.info(f"Setting stop event for test {test_id}")
+            stop_event.set()
+
+        # Close all sockets
+        logger.info(f"Closing {len(active_sockets)} active sockets")
+        for sock in list(active_sockets):
+            try:
+                sock.close()
+            except Exception as e:
+                pass
+
+        # Shutdown all executors
+        logger.info(f"Shutting down {len(active_executors)} active executors")
+        for executor in list(active_executors):
+            try:
+                executor.shutdown(wait=False)
+            except Exception as e:
+                pass
+
+        logger.info("Resource cleanup completed")
+
+
+# Register cleanup handlers
+atexit.register(cleanup_resources)
+
+
+# Signal handlers
+def signal_handler(signum, frame):
+    """Handle termination signals"""
+    logger.info(f"Received signal {signum}, initiating shutdown")
+    cleanup_resources()
+    # Give a short time for cleanup to take effect before the process gets terminated
+    time.sleep(1)
+    sys.exit(0)
+
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
+
+# FastAPI lifecycle events
+@app.on_event("shutdown")
+async def on_shutdown():
+    """Handle FastAPI shutdown event"""
+    logger.info("FastAPI shutdown event triggered")
+    cleanup_resources()
+    # Give a short time for cleanup to take effect
+    await asyncio.sleep(1)
 
 
 # Test execution methods
@@ -146,10 +236,10 @@ async def execute_tcp_flood(test_id, params, stop_event, metrics):
     end_time = start_time + duration
 
     # Create workers
-    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+    with register_executor(concurrent.futures.ThreadPoolExecutor(max_workers=threads)) as executor:
         futures = []
         for i in range(threads):
-            if stop_event.is_set():
+            if stop_event.is_set() or shutdown_in_progress:
                 break
 
             proxy = random.choice(proxies) if proxies else None
@@ -160,12 +250,17 @@ async def execute_tcp_flood(test_id, params, stop_event, metrics):
                 )
             )
 
-        # Wait for all workers to complete
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                logger.error(f"Error in worker: {e}")
+        # Wait for all workers to complete or until stop_event is set
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=duration + 10):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Error in worker: {e}")
+        except concurrent.futures.TimeoutError:
+            logger.warning(f"Some workers did not complete in time for test {test_id}")
+        except Exception as e:
+            logger.error(f"Error waiting for workers: {e}")
 
     # Update end time
     test_metrics.end_time = time.time()
@@ -183,12 +278,12 @@ def tcp_flood_worker(host, port, end_time, metrics, stop_event, proxy=None):
     """
     Worker function for TCP flood
     """
-    while time.time() < end_time and not stop_event.is_set():
+    while time.time() < end_time and not stop_event.is_set() and not shutdown_in_progress:
         s = None
         try:
             # Create socket
             if proxy:
-                s = socks.socksocket()
+                s = register_socket(socks.socksocket())
                 s.set_proxy(
                     proxy_type=socks.PROXY_TYPES[f'SOCKS{proxy.type}'] if proxy.type in [4, 5] else socks.HTTP,
                     addr=proxy.host,
@@ -197,7 +292,7 @@ def tcp_flood_worker(host, port, end_time, metrics, stop_event, proxy=None):
                     password=proxy.password
                 )
             else:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s = register_socket(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
 
             s.settimeout(3)
 
@@ -225,8 +320,9 @@ def tcp_flood_worker(host, port, end_time, metrics, stop_event, proxy=None):
                 except:
                     pass
 
-            # Small delay to prevent excessive CPU usage
-            time.sleep(0.01)
+            # Small delay to prevent excessive CPU usage, check stop condition
+            if not (stop_event.is_set() or shutdown_in_progress):
+                time.sleep(0.01)
 
 
 async def execute_udp_flood(test_id, params, stop_event, metrics):
@@ -248,10 +344,10 @@ async def execute_udp_flood(test_id, params, stop_event, metrics):
     end_time = start_time + duration
 
     # Create workers
-    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+    with register_executor(concurrent.futures.ThreadPoolExecutor(max_workers=threads)) as executor:
         futures = []
         for i in range(threads):
-            if stop_event.is_set():
+            if stop_event.is_set() or shutdown_in_progress:
                 break
 
             proxy = random.choice(proxies) if proxies else None
@@ -262,12 +358,17 @@ async def execute_udp_flood(test_id, params, stop_event, metrics):
                 )
             )
 
-        # Wait for all workers to complete
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                logger.error(f"Error in worker: {e}")
+        # Wait for all workers to complete or until stop_event is set
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=duration + 10):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Error in worker: {e}")
+        except concurrent.futures.TimeoutError:
+            logger.warning(f"Some workers did not complete in time for test {test_id}")
+        except Exception as e:
+            logger.error(f"Error waiting for workers: {e}")
 
     # Update end time
     test_metrics.end_time = time.time()
@@ -285,11 +386,11 @@ def udp_flood_worker(host, port, end_time, metrics, stop_event, proxy=None):
     """
     Worker function for UDP flood
     """
-    while time.time() < end_time and not stop_event.is_set():
+    while time.time() < end_time and not stop_event.is_set() and not shutdown_in_progress:
         s = None
         try:
             # Create socket
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s = register_socket(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
 
             # Generate random payload
             data = os.urandom(512)  # 512 byte UDP packet
@@ -314,8 +415,9 @@ def udp_flood_worker(host, port, end_time, metrics, stop_event, proxy=None):
                 except:
                     pass
 
-            # Small delay to prevent excessive CPU usage
-            time.sleep(0.001)
+            # Small delay to prevent excessive CPU usage, check stop condition
+            if not (stop_event.is_set() or shutdown_in_progress):
+                time.sleep(0.001)
 
 
 async def execute_syn_flood(test_id, params, stop_event, metrics):
@@ -340,10 +442,10 @@ async def execute_syn_flood(test_id, params, stop_event, metrics):
     end_time = start_time + duration
 
     # Create workers
-    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+    with register_executor(concurrent.futures.ThreadPoolExecutor(max_workers=threads)) as executor:
         futures = []
         for i in range(threads):
-            if stop_event.is_set():
+            if stop_event.is_set() or shutdown_in_progress:
                 break
 
             futures.append(
@@ -353,12 +455,17 @@ async def execute_syn_flood(test_id, params, stop_event, metrics):
                 )
             )
 
-        # Wait for all workers to complete
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                logger.error(f"Error in worker: {e}")
+        # Wait for all workers to complete or until stop_event is set
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=duration + 10):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Error in worker: {e}")
+        except concurrent.futures.TimeoutError:
+            logger.warning(f"Some workers did not complete in time for test {test_id}")
+        except Exception as e:
+            logger.error(f"Error waiting for workers: {e}")
 
     # Update end time
     test_metrics.end_time = time.time()
@@ -376,7 +483,7 @@ def syn_flood_worker(host, port, end_time, metrics, stop_event):
     """
     Worker function for SYN flood using scapy
     """
-    while time.time() < end_time and not stop_event.is_set():
+    while time.time() < end_time and not stop_event.is_set() and not shutdown_in_progress:
         try:
             # Create random source IP
             src_ip = f"{random.randint(1, 254)}.{random.randint(1, 254)}.{random.randint(1, 254)}.{random.randint(1, 254)}"
@@ -397,8 +504,9 @@ def syn_flood_worker(host, port, end_time, metrics, stop_event):
             metrics.failed_connects.increment()
             logger.error(f"Error in SYN flood worker: {e}")
 
-        # Small delay to prevent excessive CPU usage
-        time.sleep(0.001)
+        # Small delay to prevent excessive CPU usage, check stop condition
+        if not (stop_event.is_set() or shutdown_in_progress):
+            time.sleep(0.001)
 
 
 async def execute_tcp_connection(test_id, params, stop_event, metrics):
@@ -420,10 +528,10 @@ async def execute_tcp_connection(test_id, params, stop_event, metrics):
     end_time = start_time + duration
 
     # Create workers
-    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+    with register_executor(concurrent.futures.ThreadPoolExecutor(max_workers=threads)) as executor:
         futures = []
         for i in range(threads):
-            if stop_event.is_set():
+            if stop_event.is_set() or shutdown_in_progress:
                 break
 
             proxy = random.choice(proxies) if proxies else None
@@ -434,12 +542,17 @@ async def execute_tcp_connection(test_id, params, stop_event, metrics):
                 )
             )
 
-        # Wait for all workers to complete
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                logger.error(f"Error in worker: {e}")
+        # Wait for all workers to complete or until stop_event is set
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=duration + 10):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Error in worker: {e}")
+        except concurrent.futures.TimeoutError:
+            logger.warning(f"Some workers did not complete in time for test {test_id}")
+        except Exception as e:
+            logger.error(f"Error waiting for workers: {e}")
 
     # Update end time
     test_metrics.end_time = time.time()
@@ -461,13 +574,14 @@ def tcp_connection_worker(host, port, end_time, metrics, stop_event, proxy=None)
     max_connections = 100  # Maximum simultaneous connections per worker
 
     try:
-        while time.time() < end_time and not stop_event.is_set():
+        while time.time() < end_time and not stop_event.is_set() and not shutdown_in_progress:
             # Open new connections up to max_connections
-            while len(connections) < max_connections and time.time() < end_time and not stop_event.is_set():
+            while len(
+                    connections) < max_connections and time.time() < end_time and not stop_event.is_set() and not shutdown_in_progress:
                 try:
                     # Create socket
                     if proxy:
-                        s = socks.socksocket()
+                        s = register_socket(socks.socksocket())
                         s.set_proxy(
                             proxy_type=socks.PROXY_TYPES[f'SOCKS{proxy.type}'] if proxy.type in [4, 5] else socks.HTTP,
                             addr=proxy.host,
@@ -476,7 +590,7 @@ def tcp_connection_worker(host, port, end_time, metrics, stop_event, proxy=None)
                             password=proxy.password
                         )
                     else:
-                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        s = register_socket(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
 
                     s.settimeout(3)
                     s.connect((host, port))
@@ -498,6 +612,8 @@ def tcp_connection_worker(host, port, end_time, metrics, stop_event, proxy=None)
                     metrics.failed_connects.increment()
 
                 # Small delay between connection attempts
+                if stop_event.is_set() or shutdown_in_progress:
+                    break
                 time.sleep(0.1)
 
             # Keep connections alive
@@ -515,7 +631,9 @@ def tcp_connection_worker(host, port, end_time, metrics, stop_event, proxy=None)
                     except:
                         pass
 
-            # Wait before sending more keep-alives
+            # Wait before sending more keep-alives, check stop condition
+            if stop_event.is_set() or shutdown_in_progress:
+                break
             time.sleep(1)
 
     finally:
@@ -542,6 +660,13 @@ async def execute_test(test_params: TestParameters, background_tasks: Background
     """
     Execute a test with the specified parameters
     """
+    # Block new tests during shutdown
+    if shutdown_in_progress:
+        raise HTTPException(
+            status_code=503,
+            detail="Service is shutting down, not accepting new tests"
+        )
+
     # Generate test ID
     test_id = str(uuid.uuid4())
 
@@ -590,15 +715,21 @@ async def run_test(test_id, params, stop_event, metrics):
         # Execute test
         result = await test_method(test_id, params, stop_event, metrics)
 
-        # Store results
+        # Store results and update status
         test_results[test_id] = result
-        active_tests[test_id]["status"] = "completed"
-        active_tests[test_id]["end_time"] = time.time()
+
+        # Only update if test isn't already stopped
+        if test_id in active_tests:
+            if active_tests[test_id]["status"] != "stopped":
+                active_tests[test_id]["status"] = "completed"
+            active_tests[test_id]["end_time"] = time.time()
 
     except Exception as e:
         logger.error(f"Error executing test {test_id}: {e}")
-        active_tests[test_id]["status"] = "failed"
-        active_tests[test_id]["error"] = str(e)
+        if test_id in active_tests:
+            active_tests[test_id]["status"] = "failed"
+            active_tests[test_id]["error"] = str(e)
+            active_tests[test_id]["end_time"] = time.time()
         test_results[test_id] = {"error": str(e)}
 
     finally:
@@ -649,8 +780,23 @@ async def get_test_status(test_id: str):
         response["end_time"] = test["end_time"]
         response["duration"] = test["end_time"] - test["start_time"]
 
-    if test["status"] in ["completed", "failed"]:
-        response["results"] = test_results.get(test_id, {})
+    # Add real-time metrics if test is running
+    if test["status"] == "running" and hasattr(test, "metrics"):
+        metrics = test.get("metrics")
+        if metrics:
+            response["current_metrics"] = {
+                "packets_sent": metrics.packets_sent.value(),
+                "successful_connects": metrics.successful_connects.value(),
+                "failed_connects": metrics.failed_connects.value(),
+                "current_duration": time.time() - test["start_time"]
+            }
+
+    # Add complete results if test has finished
+    if test["status"] in ["completed", "failed", "stopped"]:
+        if test_id in test_results:
+            response["results"] = test_results[test_id]
+        else:
+            response["results"] = {"message": "No detailed results available"}
 
     return response
 
@@ -660,7 +806,9 @@ async def health_check():
     """
     Health check endpoint
     """
-    return {"status": "healthy"}
+    if shutdown_in_progress:
+        return {"status": "shutting_down", "active_tests": len(active_tests)}
+    return {"status": "healthy", "active_tests": len(active_tests)}
 
 
 if __name__ == "__main__":

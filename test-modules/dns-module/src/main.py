@@ -9,6 +9,10 @@ import random
 import uuid
 import socket
 import threading
+import signal
+import sys
+import atexit
+import weakref
 from datetime import datetime
 from enum import Enum
 import concurrent.futures
@@ -36,6 +40,12 @@ app = FastAPI(
 active_tests = {}
 test_results = {}
 test_stop_events = {}
+
+# Global variables for resource tracking
+active_executors = weakref.WeakSet()
+active_sockets = weakref.WeakSet()
+shutdown_in_progress = False
+cleanup_lock = threading.Lock()
 
 
 # Models
@@ -79,6 +89,85 @@ class TestParameters(BaseModel):
             return f"{v}:53"
 
 
+# Resource management functions
+def register_socket(sock):
+    """Register a socket for tracking and cleanup"""
+    if not shutdown_in_progress:
+        active_sockets.add(sock)
+    return sock
+
+
+def register_executor(executor):
+    """Register a thread pool executor for tracking and cleanup"""
+    if not shutdown_in_progress:
+        active_executors.add(executor)
+    return executor
+
+
+def cleanup_resources():
+    """Clean up all tracked resources"""
+    global shutdown_in_progress
+
+    with cleanup_lock:
+        if shutdown_in_progress:
+            return
+        shutdown_in_progress = True
+
+        logger.info("Starting resource cleanup...")
+
+        # Stop all tests
+        for test_id, stop_event in list(test_stop_events.items()):
+            logger.info(f"Setting stop event for test {test_id}")
+            stop_event.set()
+
+        # Close all sockets
+        logger.info(f"Closing {len(active_sockets)} active sockets")
+        for sock in list(active_sockets):
+            try:
+                sock.close()
+            except Exception as e:
+                pass
+
+        # Shutdown all executors
+        logger.info(f"Shutting down {len(active_executors)} active executors")
+        for executor in list(active_executors):
+            try:
+                executor.shutdown(wait=False)
+            except Exception as e:
+                pass
+
+        logger.info("Resource cleanup completed")
+
+
+# Register cleanup handlers
+atexit.register(cleanup_resources)
+
+
+# Signal handlers
+def signal_handler(signum, frame):
+    """Handle termination signals"""
+    logger.info(f"Received signal {signum}, initiating shutdown")
+    cleanup_resources()
+    # Give a short time for cleanup to take effect before the process gets terminated
+    time.sleep(1)
+    sys.exit(0)
+
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
+
+# FastAPI lifecycle events
+@app.on_event("shutdown")
+async def on_shutdown():
+    """Handle FastAPI shutdown event"""
+    logger.info("FastAPI shutdown event triggered")
+    cleanup_resources()
+    # Give a short time for cleanup to take effect
+    await asyncio.sleep(1)
+
+
 # Counter class for tracking statistics
 class AtomicCounter:
     def __init__(self):
@@ -116,7 +205,8 @@ class TestMetrics:
             "successful_queries": self.successful_queries.value(),
             "failed_queries": self.failed_queries.value(),
             "duration": (self.end_time or time.time()) - self.start_time,
-            "queries_per_second": self.queries_sent.value() / ((self.end_time or time.time()) - self.start_time),
+            "queries_per_second": self.queries_sent.value() / max(0.1,
+                                                                  (self.end_time or time.time()) - self.start_time),
             "success_rate": (self.successful_queries.value() / max(1, self.queries_sent.value())) * 100
         }
 
@@ -157,10 +247,10 @@ async def execute_dns_flood(test_id, params, stop_event, metrics):
     end_time = start_time + duration
 
     # Create workers
-    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+    with register_executor(concurrent.futures.ThreadPoolExecutor(max_workers=threads)) as executor:
         futures = []
         for i in range(threads):
-            if stop_event.is_set():
+            if stop_event.is_set() or shutdown_in_progress:
                 break
 
             futures.append(
@@ -170,12 +260,17 @@ async def execute_dns_flood(test_id, params, stop_event, metrics):
                 )
             )
 
-        # Wait for all workers to complete
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                logger.error(f"Error in worker: {e}")
+        # Wait for all workers to complete or until stop_event is set
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=duration + 10):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Error in worker: {e}")
+        except concurrent.futures.TimeoutError:
+            logger.warning(f"Some workers did not complete in time for test {test_id}")
+        except Exception as e:
+            logger.error(f"Error waiting for workers: {e}")
 
     # Update end time
     test_metrics.end_time = time.time()
@@ -200,7 +295,7 @@ def dns_flood_worker(host, port, rdatatype, end_time, metrics, stop_event):
     resolver.timeout = 2.0
     resolver.lifetime = 2.0
 
-    while time.time() < end_time and not stop_event.is_set():
+    while time.time() < end_time and not stop_event.is_set() and not shutdown_in_progress:
         try:
             # Generate random domain
             domain = generate_random_domain()
@@ -210,7 +305,7 @@ def dns_flood_worker(host, port, rdatatype, end_time, metrics, stop_event):
             wire = query.to_wire()
 
             # Create socket
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock = register_socket(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
             sock.settimeout(2.0)
 
             # Send query
@@ -233,8 +328,9 @@ def dns_flood_worker(host, port, rdatatype, end_time, metrics, stop_event):
         except Exception as e:
             metrics.failed_queries.increment()
 
-        # Small delay to prevent excessive CPU usage
-        time.sleep(0.01)
+        # Small delay to prevent excessive CPU usage, check stop condition
+        if not (stop_event.is_set() or shutdown_in_progress):
+            time.sleep(0.01)
 
 
 # Method mapping
@@ -249,6 +345,13 @@ async def execute_test(test_params: TestParameters, background_tasks: Background
     """
     Execute a test with the specified parameters
     """
+    # Block new tests during shutdown
+    if shutdown_in_progress:
+        raise HTTPException(
+            status_code=503,
+            detail="Service is shutting down, not accepting new tests"
+        )
+
     # Generate test ID
     test_id = str(uuid.uuid4())
 
@@ -297,15 +400,21 @@ async def run_test(test_id, params, stop_event, metrics):
         # Execute test
         result = await test_method(test_id, params, stop_event, metrics)
 
-        # Store results
+        # Store results and update status
         test_results[test_id] = result
-        active_tests[test_id]["status"] = "completed"
-        active_tests[test_id]["end_time"] = time.time()
+
+        # Only update if test isn't already stopped
+        if test_id in active_tests:
+            if active_tests[test_id]["status"] != "stopped":
+                active_tests[test_id]["status"] = "completed"
+            active_tests[test_id]["end_time"] = time.time()
 
     except Exception as e:
         logger.error(f"Error executing test {test_id}: {e}")
-        active_tests[test_id]["status"] = "failed"
-        active_tests[test_id]["error"] = str(e)
+        if test_id in active_tests:
+            active_tests[test_id]["status"] = "failed"
+            active_tests[test_id]["error"] = str(e)
+            active_tests[test_id]["end_time"] = time.time()
         test_results[test_id] = {"error": str(e)}
 
     finally:
@@ -356,8 +465,20 @@ async def get_test_status(test_id: str):
         response["end_time"] = test["end_time"]
         response["duration"] = test["end_time"] - test["start_time"]
 
-    if test["status"] in ["completed", "failed"]:
-        response["results"] = test_results.get(test_id, {})
+    # Add real-time metrics if test is running
+    if test["status"] == "running" and hasattr(test, "metrics"):
+        metrics = test.get("metrics")
+        if metrics:
+            response["current_metrics"] = {
+                "queries_sent": metrics.queries_sent.value(),
+                "successful_queries": metrics.successful_queries.value(),
+                "failed_queries": metrics.failed_queries.value(),
+                "current_duration": time.time() - test["start_time"]
+            }
+
+    # Add complete results if test has finished
+    if test["status"] in ["completed", "failed", "stopped"]:
+        response["results"] = test_results.get(test_id, {"message": "No detailed results available"})
 
     return response
 
@@ -367,7 +488,9 @@ async def health_check():
     """
     Health check endpoint
     """
-    return {"status": "healthy"}
+    if shutdown_in_progress:
+        return {"status": "shutting_down", "active_tests": len(active_tests)}
+    return {"status": "healthy", "active_tests": len(active_tests)}
 
 
 if __name__ == "__main__":
