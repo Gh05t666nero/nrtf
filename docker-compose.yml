@@ -1,0 +1,92 @@
+version: '3.8'
+
+services:
+  gateway:
+    build:
+      context: ./gateway-service
+    ports:
+      - "8080:8080"
+    environment:
+      - ORCHESTRATOR_URL=http://orchestrator:8000
+      - SECRET_KEY=${SECRET_KEY:-supersecretkey}
+    volumes:
+      - ./gateway-service/src:/app/src
+    depends_on:
+      - orchestrator
+    restart: unless-stopped
+    networks:
+      - nrtf-network
+
+  orchestrator:
+    build:
+      context: ./orchestrator-service
+    ports:
+      - "8000:8000"
+    environment:
+      - HTTP_MODULE_URL=http://http-module:8001
+      - TCP_MODULE_URL=http://tcp-module:8002
+      - DNS_MODULE_URL=http://dns-module:8003
+      - PROXY_SERVICE_URL=http://proxy-service:8010
+    volumes:
+      - ./orchestrator-service/src:/app/src
+    depends_on:
+      - http-module
+      - tcp-module
+      - proxy-service
+    restart: unless-stopped
+    networks:
+      - nrtf-network
+
+  http-module:
+    build:
+      context: ./test-modules/http-module
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./test-modules/http-module/src:/app/src
+    restart: unless-stopped
+    networks:
+      - nrtf-network
+
+  tcp-module:
+    build:
+      context: ./test-modules/tcp-module
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./test-modules/tcp-module/src:/app/src
+    # Privileged mode needed for some layer 4 tests like SYN floods
+    privileged: true
+    restart: unless-stopped
+    networks:
+      - nrtf-network
+
+  dns-module:
+    build:
+      context: ./test-modules/dns-module
+    ports:
+      - "8003:8003"
+    volumes:
+      - ./test-modules/dns-module/src:/app/src
+    restart: unless-stopped
+    networks:
+      - nrtf-network
+
+  proxy-service:
+    build:
+      context: ./proxy-service
+    ports:
+      - "8010:8010"
+    volumes:
+      - ./proxy-service/src:/app/src
+      - proxy-data:/app/data
+    restart: unless-stopped
+    networks:
+      - nrtf-network
+
+networks:
+  nrtf-network:
+    driver: bridge
+
+volumes:
+  proxy-data:
