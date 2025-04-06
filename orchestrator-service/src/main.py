@@ -195,11 +195,27 @@ async def get_proxies(proxy_type: int, count: int):
     Get proxies from the proxy service
     """
     try:
+        params = {"count": count}
+
+        # Jika proxy_type tidak sama dengan 0, sertakan dalam parameter
+        # Proxy type 0 berarti "semua tipe", jadi kita tidak mengirim parameter type
+        # sehingga proxy service akan mengembalikan semua tipe
+        if proxy_type is not None and proxy_type != 0:
+            params["type"] = proxy_type
+
+        logger.info(f"Requesting proxies with params: {params}")
+
         async with httpx.AsyncClient() as client:
             response = await client.get(
                 f"{PROXY_SERVICE_URL}/proxies",
-                params={"type": proxy_type, "count": count}
+                params=params
             )
+
+            # Check for error response
+            if response.status_code >= 400:
+                logger.error(f"Proxy service error: {response.text}")
+                return []
+
             proxies_data = response.json()
 
             # Pastikan data yang dikembalikan adalah list
@@ -219,6 +235,7 @@ async def get_proxies(proxy_type: int, count: int):
                 }
                 cleaned_proxies.append(cleaned_proxy)
 
+            logger.info(f"Received {len(cleaned_proxies)} proxies from proxy service")
             return cleaned_proxies
     except httpx.RequestError as e:
         logger.error(f"Error communicating with proxy service: {e}")
