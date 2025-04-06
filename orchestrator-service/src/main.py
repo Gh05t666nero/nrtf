@@ -200,7 +200,26 @@ async def get_proxies(proxy_type: int, count: int):
                 f"{PROXY_SERVICE_URL}/proxies",
                 params={"type": proxy_type, "count": count}
             )
-            return response.json()
+            proxies_data = response.json()
+
+            # Pastikan data yang dikembalikan adalah list
+            if not isinstance(proxies_data, list):
+                logger.error(f"Proxy service returned non-list data: {proxies_data}")
+                return []
+
+            # Pastikan hanya field yang diperlukan oleh modul tes yang disertakan
+            cleaned_proxies = []
+            for proxy in proxies_data:
+                cleaned_proxy = {
+                    "host": proxy.get("host"),
+                    "port": proxy.get("port"),
+                    "type": proxy.get("type"),
+                    "username": proxy.get("username", None),
+                    "password": proxy.get("password", None)
+                }
+                cleaned_proxies.append(cleaned_proxy)
+
+            return cleaned_proxies
     except httpx.RequestError as e:
         logger.error(f"Error communicating with proxy service: {e}")
         return []
@@ -290,7 +309,13 @@ async def execute_test(test_id: str, test: dict):
         }
 
         if proxies:
-            test_params["proxies"] = proxies
+            # Pastikan proxies berupa list sebelum ditambahkan ke test_params
+            if isinstance(proxies, list):
+                test_params["proxies"] = proxies
+                logger.info(f"Using {len(proxies)} proxies for test {test_id}")
+            else:
+                logger.error(f"Proxies is not a list, type: {type(proxies)}, value: {proxies}")
+                # Jangan tambahkan proxies jika bukan list untuk menghindari error validasi
 
         # Send test to appropriate service to initiate
         async with httpx.AsyncClient() as client:
