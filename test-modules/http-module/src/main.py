@@ -729,13 +729,14 @@ async def stop_test(test_id: str):
 @app.get("/status/{test_id}")
 async def get_test_status(test_id: str):
     """
-    Get status of a test
+    Get status of a test with more comprehensive information
     """
     if test_id not in active_tests:
         raise HTTPException(status_code=404, detail="Test not found")
 
     test = active_tests[test_id]
 
+    # Buat respons yang lebih lengkap
     response = {
         "test_id": test_id,
         "status": test["status"],
@@ -746,8 +747,23 @@ async def get_test_status(test_id: str):
         response["end_time"] = test["end_time"]
         response["duration"] = test["end_time"] - test["start_time"]
 
-    if test["status"] in ["completed", "failed"]:
-        response["results"] = test_results.get(test_id, {})
+    # Tambahkan metrik real-time jika tes sedang berjalan
+    if test["status"] == "running" and hasattr(test, "metrics"):
+        metrics = test.get("metrics")
+        if metrics:
+            response["current_metrics"] = {
+                "requests_sent": metrics.requests_sent.value(),
+                "successful_requests": metrics.successful_requests.value(),
+                "failed_requests": metrics.failed_requests.value(),
+                "current_duration": time.time() - test["start_time"]
+            }
+
+    # Tambahkan hasil lengkap jika tes sudah selesai
+    if test["status"] in ["completed", "failed", "stopped"]:
+        if test_id in test_results:
+            response["results"] = test_results[test_id]
+        else:
+            response["results"] = {"message": "No detailed results available"}
 
     return response
 

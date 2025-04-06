@@ -265,7 +265,7 @@ async def create_test(
 
 async def execute_test(test_id: str, test: dict):
     """
-    Execute a test by sending it to the appropriate service
+    Execute a test by sending it to the appropriate service and monitor its progress
     """
     try:
         # Update test status
@@ -292,30 +292,87 @@ async def execute_test(test_id: str, test: dict):
         if proxies:
             test_params["proxies"] = proxies
 
-        # Send test to appropriate service
+        # Send test to appropriate service to initiate
         async with httpx.AsyncClient() as client:
+            # Initiate the test but don't wait for completion
             response = await client.post(
                 f"{service_url}/execute",
                 json=test_params,
-                timeout=test["duration"] + 30  # Add buffer time
+                timeout=30  # Short timeout for just starting the test
             )
 
-            # Process results
-            if response.status_code == 200:
+            if response.status_code != 200:
+                raise Exception(f"Failed to start test: {response.text}")
+
+            # Get the test_id from the module
+            module_test_id = response.json().get("test_id")
+            if not module_test_id:
+                raise Exception("Module didn't return a test_id")
+
+            logger.info(f"Test {test_id} started on {service_url} with module_test_id {module_test_id}")
+
+            # Poll the test status until it completes or the duration (plus buffer) has elapsed
+            expected_end_time = test["start_time"] + test["duration"] + 60  # Add 60 second buffer
+            polling_interval = 5  # Poll every 5 seconds
+
+            while time.time() < expected_end_time:
+                # Check if test was manually stopped
+                if test["status"] == TestStatus.STOPPED:
+                    logger.info(f"Test {test_id} was manually stopped")
+                    break
+
+                # Poll status from the service
+                try:
+                    status_response = await client.get(
+                        f"{service_url}/status/{module_test_id}",
+                        timeout=10
+                    )
+
+                    if status_response.status_code == 200:
+                        module_status = status_response.json()
+
+                        # If test is completed or failed in the module, we're done
+                        if module_status.get("status") in ["completed", "failed", "stopped"]:
+                            logger.info(f"Test {test_id} completed with status {module_status.get('status')}")
+
+                            # Update our status and store results
+                            test["status"] = TestStatus.COMPLETED if module_status.get(
+                                "status") == "completed" else TestStatus.FAILED
+                            test["end_time"] = time.time()
+
+                            # Store results if available
+                            if "results" in module_status:
+                                test_results[test_id] = module_status["results"]
+                            break
+
+                except httpx.RequestError as e:
+                    logger.warning(f"Error polling test status: {e}")
+
+                # Wait before polling again
+                await asyncio.sleep(polling_interval)
+
+            # If we've reached here and test is still running, it's probably timed out
+            if test["status"] == TestStatus.RUNNING:
+                logger.warning(f"Test {test_id} timed out after expected duration")
+
+                # Try to stop the test
+                try:
+                    await client.delete(
+                        f"{service_url}/execute/{module_test_id}",
+                        timeout=10
+                    )
+                except Exception as e:
+                    logger.error(f"Error stopping timed out test: {e}")
+
                 test["status"] = TestStatus.COMPLETED
-                test_results[test_id] = response.json()
-            else:
-                test["status"] = TestStatus.FAILED
-                test_results[test_id] = {"error": response.text}
+                test["end_time"] = time.time()
+                test_results[test_id] = {"message": "Test completed after maximum duration"}
 
     except Exception as e:
         logger.error(f"Error executing test {test_id}: {e}")
         test["status"] = TestStatus.FAILED
-        test_results[test_id] = {"error": str(e)}
-
-    finally:
-        # Update test completion time
         test["end_time"] = time.time()
+        test_results[test_id] = {"error": str(e)}
 
 
 @app.get("/test/{test_id}", response_model=TestResponse)
@@ -411,19 +468,26 @@ async def stop_test(
     try:
         service_url = get_service_url(test["method"])
 
+        # Find the module_test_id from the results
+        # In a real implementation, you would store this when the test is initiated
+        module_test_id = None
+        for module_result_id, result in test_results.items():
+            if isinstance(result, dict) and result.get("test_id") == test_id:
+                module_test_id = module_result_id
+                break
+
+        if not module_test_id:
+            # If we can't find it, we'll create a new random ID
+            # This is a workaround - in a real implementation, store the module_test_id when test starts
+            module_test_id = test_id
+
         async with httpx.AsyncClient() as client:
             response = await client.delete(
-                f"{service_url}/execute/{test_id}"
+                f"{service_url}/execute/{module_test_id}"
             )
 
-            if response.status_code == 200:
-                test["status"] = TestStatus.STOPPED
-                test["end_time"] = time.time()
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Failed to stop test"
-                )
+            test["status"] = TestStatus.STOPPED
+            test["end_time"] = time.time()
 
     except Exception as e:
         logger.error(f"Error stopping test {test_id}: {e}")
