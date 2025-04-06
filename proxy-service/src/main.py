@@ -48,9 +48,6 @@ class Proxy(BaseModel):
     is_valid: Optional[bool] = None
     response_time: Optional[float] = None
 
-    class Config:
-        frozen = True  # Make the model immutable
-
     def __hash__(self):
         return hash((self.host, self.port, self.type))
 
@@ -226,16 +223,28 @@ async def validate_proxy(proxy):
                 end_time = time.time()
 
                 if response.status_code == 200:
-                    proxy.is_valid = True
-                    proxy.response_time = end_time - start_time
-                    proxy.last_checked = time.time()
-                    stats["valid_proxies"].increment()
-                    return proxy
+                    # Create a new proxy with updated values
+                    return Proxy(
+                        host=proxy.host,
+                        port=proxy.port,
+                        type=proxy.type,
+                        username=proxy.username,
+                        password=proxy.password,
+                        is_valid=True,
+                        response_time=end_time - start_time,
+                        last_checked=time.time()
+                    )
                 else:
-                    proxy.is_valid = False
-                    proxy.last_checked = time.time()
-                    stats["invalid_proxies"].increment()
-                    return proxy
+                    # Create a new proxy with updated values
+                    return Proxy(
+                        host=proxy.host,
+                        port=proxy.port,
+                        type=proxy.type,
+                        username=proxy.username,
+                        password=proxy.password,
+                        is_valid=False,
+                        last_checked=time.time()
+                    )
 
         # Use socks library to validate SOCKS proxies
         else:
@@ -250,22 +259,40 @@ async def validate_proxy(proxy):
                 result = await asyncio.wrap_future(future)
 
                 if result:
-                    proxy.is_valid = True
-                    proxy.response_time = result
-                    proxy.last_checked = time.time()
-                    stats["valid_proxies"].increment()
+                    # Create a new proxy with updated values
+                    return Proxy(
+                        host=proxy.host,
+                        port=proxy.port,
+                        type=proxy.type,
+                        username=proxy.username,
+                        password=proxy.password,
+                        is_valid=True,
+                        response_time=result,
+                        last_checked=time.time()
+                    )
                 else:
-                    proxy.is_valid = False
-                    proxy.last_checked = time.time()
-                    stats["invalid_proxies"].increment()
-
-                return proxy
+                    # Create a new proxy with updated values
+                    return Proxy(
+                        host=proxy.host,
+                        port=proxy.port,
+                        type=proxy.type,
+                        username=proxy.username,
+                        password=proxy.password,
+                        is_valid=False,
+                        last_checked=time.time()
+                    )
 
     except Exception as e:
-        proxy.is_valid = False
-        proxy.last_checked = time.time()
-        stats["invalid_proxies"].increment()
-        return proxy
+        # Create a new proxy with updated values
+        return Proxy(
+            host=proxy.host,
+            port=proxy.port,
+            type=proxy.type,
+            username=proxy.username,
+            password=proxy.password,
+            is_valid=False,
+            last_checked=time.time()
+        )
 
 
 def validate_socks_proxy(host, port, proxy_type):
@@ -325,12 +352,15 @@ async def validate_proxies(proxy_type=None, count=100):
 
     # Update proxy list with validation results
     for proxy in validated_proxies:
-        # Remove proxy from set
+        # Remove any existing proxy with same key attributes
         proxies[proxy.type].discard(proxy)
 
         # Add back if valid
         if proxy.is_valid:
+            stats["valid_proxies"].increment()
             proxies[proxy.type].add(proxy)
+        else:
+            stats["invalid_proxies"].increment()
 
     logger.info(f"Validation complete. Valid: {stats['valid_proxies'].value()}, "
                 f"Invalid: {stats['invalid_proxies'].value()}")
