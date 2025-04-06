@@ -48,6 +48,17 @@ class Proxy(BaseModel):
     is_valid: Optional[bool] = None
     response_time: Optional[float] = None
 
+    class Config:
+        frozen = True  # Make the model immutable
+
+    def __hash__(self):
+        return hash((self.host, self.port, self.type))
+
+    def __eq__(self, other):
+        if not isinstance(other, Proxy):
+            return False
+        return (self.host, self.port, self.type) == (other.host, other.port, other.type)
+
     def as_url(self) -> str:
         auth = f"{self.username}:{self.password}@" if self.username and self.password else ""
         proto = "http" if self.type == ProxyType.HTTP else f"socks{self.type}"
