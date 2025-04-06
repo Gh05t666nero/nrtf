@@ -2,8 +2,11 @@
 
 ![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
+![Python](https://img.shields.io/badge/python-3.9+-yellow.svg)
+![Docker](https://img.shields.io/badge/docker-required-blue.svg)
+![Tests](https://img.shields.io/badge/tests-passing-green.svg)
 
-A professional-grade microservices architecture for authorized network resilience testing.
+A professional-grade microservices architecture for authorized network resilience testing with comprehensive testing capabilities across HTTP, TCP/UDP, and DNS protocols.
 
 ## ⚠️ IMPORTANT DISCLAIMER ⚠️
 
@@ -17,15 +20,18 @@ Using this software against systems without explicit written permission is illeg
 
 **YOU ARE RESPONSIBLE for ensuring all necessary permissions are obtained BEFORE conducting any tests.**
 
-## Features
+## Key Features
 
-- **Modern Microservices Architecture**: Scalable and modular design
-- **Comprehensive Test Methods**: HTTP, TCP/UDP, and DNS based testing capabilities
-- **API-First Design**: Full REST API for integration with existing tools and automation
-- **Advanced Security**: Token-based authentication with role-based permissions
-- **Detailed Metrics**: Comprehensive performance metrics and reporting
-- **Proxy Support**: Automatic proxy acquisition and validation
-- **Container-Ready**: Designed for Docker deployment
+- **Modern Microservices Architecture**: Independently scalable and maintainable services
+- **Comprehensive Test Methods**: Multiple testing methodologies across different protocols
+  - HTTP-based: HTTP flood, Slow Loris, SSL flood, WAF bypass techniques
+  - TCP/UDP-based: TCP/UDP flood, connection pool exhaustion, SYN flood
+  - DNS-based: DNS query flood testing
+- **API-First Design**: RESTful API for seamless integration with existing tooling
+- **Advanced Security**: JWT-based authentication with role-based permissions
+- **Detailed Metrics**: Comprehensive performance metrics with real-time reporting
+- **Proxy Management**: Automatic proxy acquisition, validation, and rotation
+- **Container-Ready**: Optimized for Docker deployment with compose support
 
 ## Architecture Overview
 
@@ -48,39 +54,62 @@ NRTF uses a modern microservices architecture designed for scalability and modul
 
 ### Components
 
-- **API Gateway**: Central entry point handling authentication and request routing
+- **API Gateway**: Central entry point handling authentication, request routing, and rate limiting
+  - User authentication and authorization
+  - Request validation and sanitization
+  - Service discovery and request forwarding
+  
 - **Orchestrator**: Coordinates test execution across services
+  - Test scheduling and resource allocation
+  - Service health monitoring
+  - Result aggregation and reporting
+  
 - **Test Modules**: Specialized services for different protocols and test methodologies
   - **HTTP Module**: Web service testing capabilities
+    - HTTP flood, Slow Loris, SSL flood, and WAF bypass testing
   - **TCP Module**: Network protocol testing
+    - TCP/UDP flood, SYN flood, and connection pool exhaustion
   - **DNS Module**: DNS service testing
+    - DNS query flood with customizable parameters
+    
 - **Proxy Service**: Manages proxy acquisition and validation
+  - Automatic proxy sourcing and validation
+  - Proxy rotation and health checking
+  - Support for HTTP, SOCKS4, and SOCKS5 proxies
+
 - **Common Libraries**: Shared functionality for logging, validation, and utilities
 
-## Test Methods
+## Comprehensive Test Methods
 
 ### HTTP Layer Tests
 
-- **HTTP_FLOOD**: High-volume HTTP request flood
-- **SLOW_LORIS**: Connection exhaustion through slow requests
-- **SSL_FLOOD**: TLS/SSL handshake and renegotiation stress testing
-- **HTTP_BYPASS**: WAF and protection bypass techniques
+| Method | Description | Use Case |
+|--------|-------------|----------|
+| **HTTP_FLOOD** | High-volume HTTP request flood | Tests web server capacity and CDN resilience |
+| **SLOW_LORIS** | Connection exhaustion through slow requests | Tests connection timeout handling |
+| **SSL_FLOOD** | TLS/SSL handshake and renegotiation stress testing | Tests SSL termination efficiency |
+| **HTTP_BYPASS** | WAF and protection bypass techniques | Tests defense evasion detection |
 
 ### TCP/UDP Layer Tests
 
-- **TCP_FLOOD**: Standard TCP connection flood
-- **UDP_FLOOD**: UDP packet flood
-- **TCP_CONNECTION**: Connection pool exhaustion
-- **SYN_FLOOD**: TCP SYN packet flood
+| Method | Description | Use Case |
+|--------|-------------|----------|
+| **TCP_FLOOD** | Standard TCP connection flood | Tests TCP stack and connection handling |
+| **UDP_FLOOD** | UDP packet flood | Tests UDP service capacity and filtering |
+| **TCP_CONNECTION** | Connection pool exhaustion | Tests connection table capacity |
+| **SYN_FLOOD** | TCP SYN packet flood | Tests SYN cookie implementation and backlog queues |
 
 ### DNS Tests
 
-- **DNS_FLOOD**: DNS query flood testing
+| Method | Description | Use Case |
+|--------|-------------|----------|
+| **DNS_FLOOD** | DNS query flood testing | Tests DNS server capacity and caching |
 
 ## Getting Started
 
 ### Prerequisites
-- Docker and Docker Compose
+- Docker Engine 20.10+
+- Docker Compose 2.0+
 - Python 3.9+
 - Access to target systems with proper authorization
 
@@ -143,10 +172,14 @@ curl -X POST "http://localhost:8080/api/test" \
 
 Configuration is managed through environment variables defined in the `.env` file:
 
-- `SECRET_KEY`: Authentication secret key
-- `ACCESS_TOKEN_EXPIRE_MINUTES`: Token expiration time
-- `MAX_TEST_DURATION`: Maximum allowed test duration
-- `MAX_THREADS`: Maximum allowed threads per test
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `SECRET_KEY` | Authentication secret key | Generated during install |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | Token expiration time | 30 |
+| `MAX_TEST_DURATION` | Maximum allowed test duration (seconds) | 300 |
+| `MAX_THREADS` | Maximum allowed threads per test | 1000 |
+| `MAX_REQUESTS_PER_MINUTE` | API rate limiting | 60 |
+| `MAX_CONCURRENT_TESTS` | Maximum tests running simultaneously | 5 |
 
 See `.env.example` for all available options.
 
@@ -157,11 +190,15 @@ See `.env.example` for all available options.
 For local development without Docker:
 
 1. Set up virtual environments in each service directory
-2. Install requirements:
 ```bash
+# Example for gateway service
+cd gateway-service
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
-3. Run services individually:
+
+2. Run services individually:
 ```bash
 uvicorn src.main:app --reload --port 8000
 ```
@@ -177,6 +214,31 @@ pytest
 ### Adding New Test Methods
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for details on adding new test methods.
+
+## Production Deployment Considerations
+
+For production deployments, consider the following:
+
+1. **Security Hardening**:
+   - Change all default credentials
+   - Use a proper secrets management solution
+   - Enable TLS for all service communication
+   - Implement IP-based access controls
+
+2. **Scaling**:
+   - Deploy behind a load balancer
+   - Use Kubernetes for orchestration
+   - Implement horizontal scaling for test modules
+
+3. **Monitoring**:
+   - Add Prometheus metrics collection
+   - Set up Grafana dashboards
+   - Implement alerting for system issues
+
+4. **Backup and Disaster Recovery**:
+   - Implement proper database backups
+   - Create restore procedures
+   - Document disaster recovery steps
 
 ## Detailed Documentation
 
@@ -194,9 +256,20 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - Built with best practices in microservices architecture
 - Designed for professional network resilience testing
 
-## Contact & Support
+## Support & Contact
 
 Please open an issue on the GitHub repository for bugs, feature requests, or questions.
+
+For security-related issues, please contact us directly at `hubungi@fauzan.biz.id`.
+
+## Roadmap
+
+Future development plans include:
+
+- Additional test methods for application layer testing
+- Enhanced reporting with data visualization
+- Integration with CI/CD pipelines
+- Support for distributed testing across multiple agents
 
 ---
 
